@@ -47,55 +47,41 @@ más del protocolo interno (posiblemente el mecanismo de acks) que no se
 terminó de reversar. Documentado tal cual quedó, no se borra porque casi
 funciona y puede retomarse con otra sesión de captura.
 
-## Aislamiento de proceso
+## Intento descartado: aislar la firma en un proceso Electron aparte
 
-`TikTokLiveClient#connect()` (`src/client.js`) **no crea la `BrowserWindow`
-en el proceso que la llama** — lanza un proceso Electron aparte
-(`src/signing/worker-entry.js`, via `child_process.spawn(process.execPath, ...)`)
-dedicado a esa sola conexión, y se comunica con él por IPC. `LiveWindow`
-(`src/signing/live-window.js`) sigue siendo la implementación real de la
-firma+WS; el worker solo la corre aislada.
+Se probó (y se revirtió) mover `LiveWindow` a un proceso Electron dedicado
+(`spawn(process.execPath, [workerScript, username])` + IPC), motivado por un
+bug real visto en producción: corriendo `LiveWindow` en el mismo proceso que
+un servidor Express + WS server + hooks globales (uiohook-napi), TikTok
+rechazaba la firma con `403` y `X-Bogus`/`msToken` con valores placeholder
+(`X-Bogus=1`, `msToken` vacío) de forma intermitente, más frecuente cuando se
+hacían varios intentos de conexión seguidos en poco tiempo.
 
-**Por qué:** validado en producción contra TikLiveTTS — corriendo
-`LiveWindow` en el mismo proceso que un servidor Express + WS server +
-hooks globales (uiohook-napi), TikTok rechazaba la firma con `403` y
-`X-Bogus`/`msToken` con valores placeholder (`X-Bogus=1`, `msToken` vacío)
-de forma consistente y reproducible, incluso con sesión/`device_id` recién
-creado — o sea, no era rate-limit ni sesión marcada, era específicamente
-"este proceso Electron generó una firma inválida". El mismo código,
-corriendo en un proceso Electron standalone sin nada más alrededor, firmó
-bien el 100% de las veces. No se identificó la causa exacta dentro de
-Chromium/V8 (se descartaron por prueba: cache del Service Worker, timers
-throttleados por ventana en background, uiohook-napi) — el fix fue aislar
-el proceso, no perseguir el porqué exacto.
+El aislamiento de proceso funcionaba siempre en dev (`npm run electron`), pero
+en un **build empaquetado real** (NSIS, `electron-builder`) el proceso hijo
+(segunda instancia del mismo exe) moría consistentemente ~2-3s después de
+navegar a la URL real de TikTok — sin crashear (sin `render-process-gone`, sin
+excepción, `exit code 0`) y sin rastro en los logs de Windows (Application,
+System, Windows Defender). Se descartaron por prueba: condición de carrera en
+el IPC antes del `quit()`, `setTimeout` de seguridad sin `.unref()`,
+`backgroundThrottling`, `uiohook-napi` activo en el proceso padre, y una
+repackeada manual del asar como causa (se reprodujo igual con un build 100%
+oficial vía `npm run build:electron`). No se identificó la causa raíz — dado
+que reproducía el 100% de las veces en el build empaquetado (peor que el bug
+intermitente original), se revirtió a `LiveWindow` corriendo directo en el
+proceso del caller, el camino ya validado en producción real.
 
-**Contrato para la app consumidora:** en dev, `electron <script>` ya
-arranca `worker-entry.js` directo por `argv`, no hace falta nada extra. En
-un build **empaquetado**, `process.execPath` es el exe de la app, que
-siempre carga su propio entrypoint sin importar el `argv` — por eso
-`client.js` además pasa `TIKLIVETTS_WORKER_SCRIPT` por variable de entorno,
-y el entrypoint de la app consumidora tiene que chequearla ANTES de su
-bootstrap normal:
-
-```js
-// main.js, primera linea util, antes de cualquier otro require con side-effects
-if (process.env.TIKLIVETTS_WORKER_SCRIPT) {
-  require(process.env.TIKLIVETTS_WORKER_SCRIPT);
-  return;
-}
-```
-
-Sin este chequeo, cada intento de conexión a TikTok abriría una segunda
-instancia completa de la app empaquetada en vez del worker aislado.
+**Si se reintenta este camino en el futuro:** confirmar primero que un build
+empaquetado real (no dev) sobrevive una conexión contra un live real antes de
+invertir en el resto del diseño — ahí es donde se rompía.
 
 ## Requisito de entorno
 
 **Necesita un proceso Electron vivo durante TODA la conexión**, no solo al
-arrancar — la `BrowserWindow` invisible del worker se queda corriendo
-(silenciada con `setAudioMuted(true)`, nunca se escucha el audio del live).
-A diferencia de `tiktok-live-connector`, este paquete **no funciona en Node
-puro**; necesita poder lanzar un proceso Electron completo (`process.execPath`
-tiene que resolver a un binario de Electron o a una app empaquetada con él).
+arrancar — la `BrowserWindow` invisible se queda corriendo (silenciada con
+`setAudioMuted(true)`, nunca se escucha el audio del live). A diferencia de
+`tiktok-live-connector`, este paquete **no funciona en Node puro** ni en un
+script standalone sin Electron.
 
 ## Sesión
 

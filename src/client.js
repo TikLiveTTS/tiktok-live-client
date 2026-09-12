@@ -1,106 +1,80 @@
 'use strict';
 
 const { EventEmitter } = require('events');
-const path = require('path');
-const { spawn } = require('child_process');
-const { SigningError, NotLiveError } = require('./signing/live-window');
+const { LiveWindow, SigningError, NotLiveError } = require('./signing/live-window');
+const { isFanClubMember } = require('./decode/is-fan-club-member');
 
-const WORKER_SCRIPT = path.join(__dirname, 'signing', 'worker-entry.js');
-const CONTROL_TYPES = new Set(['connected', 'connect-error', 'error', 'close', 'streamEnd']);
+// Mapea cada tipo de mensaje decodificado (ver src/decode/decode-ws-frame.js)
+// al shape publico documentado en el README — nunca se emite el objeto
+// protobuf crudo, solo los campos que TikLiveTTS necesita.
+function toPublicPayload(method, data) {
+  const user = data.user || {};
+  const base = { uniqueId: user.uniqueId || null, nickname: user.nickname || null };
 
-function reviveError(payload) {
-  const Ctor = payload.code === 'NOT_LIVE' ? NotLiveError : payload.code === 'SIGNING_FAILED' ? SigningError : Error;
-  const err = Ctor === NotLiveError
-    ? new NotLiveError(payload.username, { emptyBody: payload.emptyBody })
-    : new Ctor(payload.message);
-  err.message = payload.message;
-  if (payload.stack) err.stack = payload.stack;
-  return err;
+  switch (method) {
+    case 'WebcastChatMessage':
+      return ['chat', { ...base, comment: data.comment, msgId: data.common && data.common.msgId, createTime: data.common && data.common.createTime, isFanClubMember: isFanClubMember(user) }];
+    case 'WebcastGiftMessage':
+      return ['gift', { ...base, giftId: data.giftId, giftName: data.gift && data.gift.name, diamondCount: data.gift && data.gift.diamondCount, groupCount: data.groupCount, isFanClubMember: isFanClubMember(user) }];
+    case 'WebcastLikeMessage':
+      return ['like', { ...base, likeCount: data.count, isFanClubMember: isFanClubMember(user) }];
+    case 'WebcastMemberMessage':
+      return ['member', { ...base, isFanClubMember: isFanClubMember(user) }];
+    case 'WebcastSocialMessage':
+      return data.kind ? [data.kind, base] : null;
+    case 'WebcastRoomUserSeqMessage':
+      return ['roomUserSeq', { viewerCount: data.viewerCount }];
+    default:
+      return null;
+  }
 }
 
-// Ver README#aislamiento-de-proceso: la firma anti-bot de TikTok corre en un
-// proceso Electron DEDICADO (worker-entry.js), lanzado con el mismo binario
-// que ya esta corriendo (process.execPath) — nunca en el proceso principal
-// de la app consumidora. Se detecto en produccion que compartir proceso con
-// un servidor Express/WS y otros hooks globales hace que TikTok rechace la
-// firma (403, X-Bogus placeholder) de forma consistente, mientras que un
-// proceso Electron dedicado sin otra carga alrededor firma bien siempre.
+// Ver README#arquitectura: la ventana invisible (LiveWindow) hace todo el
+// trabajo pesado (signing, WS, protocolo interno de TikTok) — este cliente
+// solo traduce los mensajes ya decodificados al contrato publico.
 //
-// Apps empaquetadas: process.execPath es el propio exe de la app, que carga
-// su entrypoint normal sin importar el argv. Por eso ademas del argv se pasa
-// TIKLIVETTS_WORKER_SCRIPT por env — el entrypoint de la app consumidora
-// tiene que chequearlo ANTES de su bootstrap normal y hacer
-// `require(process.env.TIKLIVETTS_WORKER_SCRIPT)` si esta presente (ver
-// ejemplo en el README). En dev, `electron <script>` ya arranca el script
-// directo por argv y el env var no hace falta, pero se manda igual por si
-// el empaquetado friend usa otro mecanismo de arranque.
+// ponytail: se probo aislar esto en un proceso Electron dedicado
+// (spawn(process.execPath, ...) + IPC) para separar la firma del proceso
+// principal de la app consumidora. Funcionaba siempre en dev, pero en un
+// build empaquetado real el proceso hijo (segunda instancia del mismo exe)
+// moria consistentemente ~2-3s despues de navegar a la URL real de TikTok,
+// sin crashear (sin render-process-gone, sin excepcion, exit code 0) y sin
+// rastro en los logs de Windows — no se identifico la causa exacta pese a
+// varias rondas de diagnostico (CDP, IPC, backgroundThrottling, etc.). Se
+// revirtio a correr LiveWindow directo en el proceso del caller: es el
+// camino ya validado en produccion real (ver historial de commits). Si en
+// el futuro se reintenta el aislamiento de proceso, arrancar confirmando
+// primero que un build empaquetado real (no `npm run electron` en dev)
+// sobrevive una conexion contra un live real.
 class TikTokLiveClient extends EventEmitter {
   constructor(username) {
     super();
     this.username = username;
-    this.child = null;
+    this.liveWindow = null;
   }
 
   async connect() {
-    this.child = spawn(process.execPath, [WORKER_SCRIPT, this.username], {
-      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-      env: { ...process.env, TIKLIVETTS_WORKER_SCRIPT: WORKER_SCRIPT },
+    this.liveWindow = new LiveWindow(this.username);
+
+    this.liveWindow.on('message', ({ method, data }) => {
+      if (!data) return;
+      const mapped = toPublicPayload(method, data);
+      if (mapped) this.emit(mapped[0], mapped[1]);
     });
+    this.liveWindow.on('error', (err) => this.emit('error', err));
+    this.liveWindow.on('close', () => this.emit('disconnected'));
+    // El streamer corto el directo (check_alive dejo de reportar alive=true).
+    // LiveWindow ya llama a su propio disconnect() despues de emitir esto —
+    // el 'close'/'disconnected' que sigue es un no-op para quien ya limpio
+    // su estado en 'streamEnd' (mismo contrato que tiktok-live-connector).
+    this.liveWindow.on('streamEnd', () => this.emit('streamEnd'));
 
-    return new Promise((resolve, reject) => {
-      let settled = false;
-
-      this.child.on('message', (msg) => {
-        if (!msg || typeof msg.type !== 'string') return;
-        if (msg.type === 'connected') {
-          settled = true;
-          resolve({ roomInfo: msg.payload.roomInfo });
-          return;
-        }
-        if (msg.type === 'connect-error') {
-          settled = true;
-          reject(reviveError(msg.payload));
-          return;
-        }
-        if (msg.type === 'error') {
-          this.emit('error', reviveError(msg.payload));
-          return;
-        }
-        if (msg.type === 'close') {
-          this.emit('disconnected');
-          return;
-        }
-        if (msg.type === 'streamEnd') {
-          this.emit('streamEnd');
-          return;
-        }
-        if (!CONTROL_TYPES.has(msg.type)) this.emit(msg.type, msg.payload);
-      });
-
-      this.child.on('exit', (code) => {
-        if (settled) return;
-        settled = true;
-        reject(new Error(`El proceso de firma de TikTok termino inesperadamente (code ${code})`));
-      });
-
-      this.child.on('error', (err) => {
-        if (settled) return;
-        settled = true;
-        reject(err);
-      });
-    });
+    const { roomInfo } = await this.liveWindow.connect();
+    return { roomInfo };
   }
 
   disconnect() {
-    if (!this.child || this.child.killed) return;
-    try {
-      this.child.send('disconnect');
-    } catch (_) { /* el pipe ya pudo haberse cerrado */ }
-    // best-effort: si el hijo no cierra solo (ver worker-entry.js#disconnect),
-    // no dejarlo huerfano.
-    setTimeout(() => {
-      if (this.child && !this.child.killed) this.child.kill();
-    }, 2000).unref();
+    if (this.liveWindow) this.liveWindow.disconnect();
   }
 }
 

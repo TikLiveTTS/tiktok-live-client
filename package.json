@@ -1,6 +1,6 @@
 {
   "name": "@tiklivetts/tiktok-live-client",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "description": "Cliente local de TikTok LIVE (chat, gifts, likes, follows, viewer count) sin depender de un servicio de firma de pago (Eulerstream) — resuelve la firma anti-bot con un Chromium invisible propio.",
   "main": "src/index.js",
