@@ -84,8 +84,7 @@ client.on('share', (data) => { /* ... */ });
 client.on('roomUserSeq', ({ viewerCount }) => { /* ... */ }); // viewer count en vivo
 client.on('disconnected', () => { /* ... */ }); // la ventana se cerro/murio
 client.on('error', (err) => { /* err es un Error real, con .message y .stack */ });
-// streamEnd: TODO, no implementado todavia (no se investigo como distinguir
-// "el streamer corto" de otras formas de desconexion).
+client.on('streamEnd', () => { /* el streamer corto el directo */ });
 
 client.disconnect();
 client.removeAllListeners();
@@ -133,8 +132,19 @@ filtrar el TTS para leer solo chat de miembros del club de fans si se quiere.
 - **`disconnected`**: sin payload. La ventana invisible se cerró/murió — no
   hay reconexión automática todavía (ver "Preguntas abiertas"), la política
   de reintento tiene que vivir en TikLiveTTS por ahora.
-- **`streamEnd`**: TODO, no implementado — no se investigó cómo distinguir
-  "el streamer cortó el directo" de otras formas de desconexión.
+- **`streamEnd`**: sin payload. El streamer cortó el directo. Se detecta
+  escuchando (vía CDP, mismo mecanismo que `room/enter/`) las respuestas de
+  `webcast/room/check_alive/` — el endpoint que la propia página de TikTok ya
+  pollea cada ~6s — y disparando cuando el primer elemento de `data` trae
+  `alive: false`. Ese shape (`{ data: [{ alive, ... }] }`) no está validado
+  contra una captura propia de un directo terminando (no hay ninguna
+  committeada en el repo), solo es consistente con lo documentado por otros
+  proyectos que reversaron esta misma API — falla en modo seguro: si TikTok
+  cambia el shape, `alive` nunca pasa a `false` y el evento simplemente no
+  dispara (mismo comportamiento que antes de este cambio). Después de emitir
+  `streamEnd`, `LiveWindow` llama a su propio `disconnect()` — el
+  `disconnected` que sigue inmediatamente es normal, no hace falta manejarlo
+  aparte.
 
 ### Manejo de fallas de signing
 
@@ -144,6 +154,18 @@ navegar, timeout, etc.), `connect()` rechaza con un `Error` tipado
 lanza excepciones sin capturar — todo error observable sale por `error` o por
 el rechazo de la promesa de `connect()`, para que TikLiveTTS lo pueda loguear
 a GlitchTip igual que hace con sus otros canales.
+
+Si la sala no está en vivo (nunca empezó o ya terminó), `connect()` rechaza
+con un `NotLiveError` (`err.code === 'NOT_LIVE'`, `err.message === "The
+requested user isn't online :("`). Se detecta leyendo `roomInfo.status` de la
+respuesta de `room/enter/` — `status === 2` es el único valor confirmado
+como "en vivo" contra una captura real; cualquier otro valor (o un body que
+no parsea) se trata como no-en-vivo. No distingue "nunca empezó" de "ya
+terminó" porque no hay una captura real del caso offline para separar los
+códigos con confianza — el texto del mensaje es intencionalmente igual al que
+usaba `tiktok-live-connector`, para que el filtro de errores esperados que ya
+tiene TikLiveTTS (`ERRORES_CONEXION_ESPERADOS` en `electron-shell/glitchtip.js`)
+lo reconozca sin cambios.
 
 ## Versionado y publicación
 
@@ -248,6 +270,16 @@ consistentes, sin pérdida ni duplicación.
    badge "No.1" de top contribuyente, que podría ser algo distinto al nivel
    del club en sí). No es parte del pedido original (solo se necesitaba
    distinguir miembro/no-miembro), así que no se investigó más.
+4. **`streamEnd` vía `check_alive` sin validar contra una captura propia** —
+   el shape `{ data: [{ alive, ... }] }` es consistente con lo documentado
+   por otros proyectos que reversaron esta API, pero nunca se capturó tráfico
+   real de un directo terminando con este repo. Si algún día se corre
+   `spike:ws` mientras un streamer corta, conviene confirmar el shape real y,
+   si hace falta, ajustar el parseo en `live-window.js`.
+5. **`NotLiveError` no distingue "nunca empezó" de "ya terminó"** — mismo
+   motivo que el punto anterior: sin una captura real del caso offline no se
+   puede mapear con confianza qué otros valores toma `roomInfo.status` aparte
+   de `2` (en vivo).
 
 ## Estado
 
@@ -269,4 +301,8 @@ consistentes, sin pérdida ni duplicación.
 - [ ] Reconexión con backoff cuando el WS cae.
 - [ ] Camino alternativo Node-WS puro (sin mantener el Chromium vivo) —
       incompleto, ver "Por qué existe".
-- [ ] Publicación inicial a GitHub Packages.
+- [x] Publicación inicial a GitHub Packages (`0.1.0`, registro privado de `TikLiveTTS`).
+- [x] Detección de sala offline (`NotLiveError`, via `roomInfo.status`) y de
+      fin de directo (`streamEnd`, via polling de `check_alive`) — ninguna de
+      las dos validada contra una captura real del caso offline/fin, ver
+      "Preguntas abiertas" #4 y #5.

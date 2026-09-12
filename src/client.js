@@ -1,7 +1,7 @@
 'use strict';
 
 const { EventEmitter } = require('events');
-const { LiveWindow, SigningError } = require('./signing/live-window');
+const { LiveWindow, SigningError, NotLiveError } = require('./signing/live-window');
 const { isFanClubMember } = require('./decode/is-fan-club-member');
 
 // Mapea cada tipo de mensaje decodificado (ver src/decode/decode-ws-frame.js)
@@ -49,6 +49,11 @@ class TikTokLiveClient extends EventEmitter {
     });
     this.liveWindow.on('error', (err) => this.emit('error', err));
     this.liveWindow.on('close', () => this.emit('disconnected'));
+    // El streamer corto el directo (check_alive dejo de reportar alive=true).
+    // LiveWindow ya llama a su propio disconnect() despues de emitir esto —
+    // el 'close'/'disconnected' que sigue es un no-op para quien ya limpio
+    // su estado en 'streamEnd' (mismo contrato que tiktok-live-connector).
+    this.liveWindow.on('streamEnd', () => this.emit('streamEnd'));
 
     const { roomInfo } = await this.liveWindow.connect();
     return { roomInfo };
@@ -59,4 +64,4 @@ class TikTokLiveClient extends EventEmitter {
   }
 }
 
-module.exports = { TikTokLiveClient, SigningError };
+module.exports = { TikTokLiveClient, SigningError, NotLiveError };

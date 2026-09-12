@@ -6,6 +6,7 @@ const { decodeWsFrame } = require('../decode/decode-ws-frame');
 
 const WS_URL_PATTERN = /webcast-ws\.tiktok\.com\/webcast\/im\/ws_proxy/;
 const ROOM_ENTER_PATTERN = /webcast\/room\/enter\//;
+const CHECK_ALIVE_PATTERN = /webcast\/room\/check_alive\//;
 const SESSION_PARTITION = 'persist:tiktok-live-client';
 
 class SigningError extends Error {
@@ -13,6 +14,21 @@ class SigningError extends Error {
     super(message);
     this.name = 'SigningError';
     this.code = 'SIGNING_FAILED';
+  }
+}
+
+// roomInfo.status === 2 es "en vivo" (unico valor confirmado contra una
+// captura real, ver spike/captures/). Cualquier otro valor (o un body que no
+// parsea) se trata como "no esta en vivo" — no se distingue "nunca empezo" de
+// "ya termino" porque no hay una captura real del caso offline para separar
+// los codigos con confianza; ambos casos son "expected" para el consumidor
+// (mismo texto que ya reconoce ERRORES_CONEXION_ESPERADOS en TikLiveTTS).
+class NotLiveError extends Error {
+  constructor(username) {
+    super(`The requested user isn't online :(`);
+    this.name = 'NotLiveError';
+    this.code = 'NOT_LIVE';
+    this.username = username;
   }
 }
 
@@ -44,6 +60,17 @@ class LiveWindow extends EventEmitter {
     this.dbg.attach();
     await this.dbg.sendCommand('Network.enable');
 
+    // TikTok mismo pollea este endpoint cada ~6s durante toda la sesion (ver
+    // README#protocolo-de-red) — se escucha via CDP igual que room/enter en
+    // vez de reversar el protobuf del WS (no hay ninguna captura de un
+    // WebcastControlMessage de fin de directo en el repo). Shape asumido
+    // `{ data: [{ alive: bool, ... }] }`, consistente con otros proyectos que
+    // reversaron esta misma API — no validado contra una captura propia. Fail
+    // safe: si el shape no matchea, `alive` queda true y esto nunca dispara
+    // (mismo comportamiento que antes de este cambio, sin regresion).
+    let streamEnded = false;
+    const pendingCheckAlive = new Map();
+
     const roomInfo = await new Promise((resolve, reject) => {
       let resolved = false;
       const pendingRoomEnter = new Map();
@@ -57,18 +84,52 @@ class LiveWindow extends EventEmitter {
           pendingRoomEnter.set(params.requestId, true);
           return;
         }
+        if (method === 'Network.responseReceived' && CHECK_ALIVE_PATTERN.test(params.response.url || '')) {
+          pendingCheckAlive.set(params.requestId, true);
+          return;
+        }
+        if (method === 'Network.loadingFinished' && pendingCheckAlive.has(params.requestId)) {
+          pendingCheckAlive.delete(params.requestId);
+          if (streamEnded) return;
+          this.dbg.sendCommand('Network.getResponseBody', { requestId: params.requestId })
+            .then((res) => {
+              if (streamEnded) return;
+              let alive = true;
+              try {
+                const body = JSON.parse(res.body);
+                const entry = Array.isArray(body.data) ? body.data[0] : body.data;
+                if (entry && entry.alive === false) alive = false;
+              } catch (_) { /* shape inesperado: se ignora, no se asume fin de directo */ }
+              if (!alive) {
+                streamEnded = true;
+                this.emit('streamEnd');
+                this.disconnect();
+              }
+            })
+            .catch(() => { /* best-effort */ });
+          return;
+        }
         if (method === 'Network.loadingFinished' && pendingRoomEnter.has(params.requestId)) {
           pendingRoomEnter.delete(params.requestId);
           this.dbg.sendCommand('Network.getResponseBody', { requestId: params.requestId })
             .then((res) => {
               if (resolved) return;
+              let data = null;
+              try {
+                data = JSON.parse(res.body).data;
+              } catch (_) { /* data queda null, se trata como offline abajo */ }
+
+              if (!data || data.status !== 2) {
+                resolved = true;
+                clearTimeout(timer);
+                if (this.win && !this.win.isDestroyed()) this.win.destroy();
+                reject(new NotLiveError(this.username));
+                return;
+              }
+
               resolved = true;
               clearTimeout(timer);
-              try {
-                resolve(JSON.parse(res.body).data);
-              } catch (_) {
-                resolve(null);
-              }
+              resolve(data);
             })
             .catch(() => { /* best-effort */ });
           return;
@@ -106,4 +167,4 @@ class LiveWindow extends EventEmitter {
   }
 }
 
-module.exports = { LiveWindow, SigningError };
+module.exports = { LiveWindow, SigningError, NotLiveError };
