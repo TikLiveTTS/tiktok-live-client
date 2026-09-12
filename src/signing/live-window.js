@@ -8,6 +8,8 @@ const WS_URL_PATTERN = /webcast-ws\.tiktok\.com\/webcast\/im\/ws_proxy/;
 const ROOM_ENTER_PATTERN = /webcast\/room\/enter\//;
 const CHECK_ALIVE_PATTERN = /webcast\/room\/check_alive\//;
 const SESSION_PARTITION = 'persist:tiktok-live-client';
+const EMPTY_BODY_MAX_ATTEMPTS = 3;
+const EMPTY_BODY_RETRY_DELAY_MS = 500;
 
 class SigningError extends Error {
   constructor(message) {
@@ -18,17 +20,27 @@ class SigningError extends Error {
 }
 
 // roomInfo.status === 2 es "en vivo" (unico valor confirmado contra una
-// captura real, ver spike/captures/). Cualquier otro valor (o un body que no
-// parsea) se trata como "no esta en vivo" — no se distingue "nunca empezo" de
-// "ya termino" porque no hay una captura real del caso offline para separar
-// los codigos con confianza; ambos casos son "expected" para el consumidor
-// (mismo texto que ya reconoce ERRORES_CONEXION_ESPERADOS en TikLiveTTS).
+// captura real, ver spike/captures/). Cualquier otro valor con un body bien
+// formado se trata como "no esta en vivo" de verdad — no se distingue "nunca
+// empezo" de "ya termino" porque no hay una captura real del caso offline
+// para separar los codigos con confianza; ambos casos son "expected" para el
+// consumidor (mismo texto que ya reconoce ERRORES_CONEXION_ESPERADOS en
+// TikLiveTTS).
+//
+// `emptyBody: true` marca el caso distinto: el body de room/enter vino VACIO
+// (no un JSON de TikTok, nada) — visto en produccion (proceso Electron con
+// Express/WS server corriendo al lado) contra canales confirmados en vivo en
+// ese mismo instante, mientras un proceso Electron standalone con el mismo
+// codigo conectaba bien. No es una respuesta real de "no en vivo" de TikTok,
+// parece una falla transitoria de Network.getResponseBody bajo carga del
+// proceso principal — `connect()` reintenta unicamente para este caso.
 class NotLiveError extends Error {
-  constructor(username) {
+  constructor(username, { emptyBody = false } = {}) {
     super(`The requested user isn't online :(`);
     this.name = 'NotLiveError';
     this.code = 'NOT_LIVE';
     this.username = username;
+    this.emptyBody = emptyBody;
   }
 }
 
@@ -46,12 +58,34 @@ class LiveWindow extends EventEmitter {
     this.dbg = null;
   }
 
-  async connect({ timeoutMs = 30000 } = {}) {
+  // Reintenta SOLO el caso "body vacio" (ver NotLiveError#emptyBody) con una
+  // ventana nueva — un `status !== 2` con datos reales de TikTok se respeta
+  // a la primera, sin retraso, porque ahi confiamos en la respuesta.
+  async connect(opts = {}) {
+    for (let attempt = 1; attempt <= EMPTY_BODY_MAX_ATTEMPTS; attempt++) {
+      try {
+        return await this._connectOnce(opts);
+      } catch (err) {
+        const lastAttempt = attempt === EMPTY_BODY_MAX_ATTEMPTS;
+        if (!(err instanceof NotLiveError) || !err.emptyBody || lastAttempt) throw err;
+        await new Promise((r) => setTimeout(r, EMPTY_BODY_RETRY_DELAY_MS));
+      }
+    }
+    return undefined; // inalcanzable, el loop siempre retorna o lanza
+  }
+
+  async _connectOnce({ timeoutMs = 30000 } = {}) {
     const spikeSession = session.fromPartition(SESSION_PARTITION);
-    this.win = new BrowserWindow({ show: false, webPreferences: { session: spikeSession } });
+    this.win = new BrowserWindow({ show: false, webPreferences: { session: spikeSession, backgroundThrottling: false } });
     // La pagina real de TikTok reproduce el video/audio del live — invisible
     // no significa muda. Sin esto el usuario escucharia el live de fondo.
     this.win.webContents.setAudioMuted(true);
+    // Ventana invisible (show:false) = "background" para Chromium, que
+    // throttlea sus timers/rAF por defecto. El JS anti-bot de TikTok hace
+    // checks sensibles a timing — se descarta explicitamente por las dudas,
+    // aunque el aislamiento de proceso (ver README) fue lo que realmente
+    // arreglo el problema real (403 con X-Bogus/msToken invalidos).
+    this.win.webContents.setBackgroundThrottling(false);
 
     // Bug conocido de Electron (electron/electron#14810): sendCommand no
     // resuelve hasta que la ventana tiene algo cargado.
@@ -123,7 +157,7 @@ class LiveWindow extends EventEmitter {
                 resolved = true;
                 clearTimeout(timer);
                 if (this.win && !this.win.isDestroyed()) this.win.destroy();
-                reject(new NotLiveError(this.username));
+                reject(new NotLiveError(this.username, { emptyBody: !res.body }));
                 return;
               }
 
