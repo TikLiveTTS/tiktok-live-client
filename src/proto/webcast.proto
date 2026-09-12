@@ -1,0 +1,145 @@
+syntax = "proto3";
+package tiktoklive;
+
+// Numeros de campo validados contra bytes reales capturados de un live en
+// vivo (ver spike/captures/ y README.md#hallazgos-del-spike), NO copiados de
+// ninguna libreria de terceros. Solo se declaran los campos que TikLiveTTS
+// consume hoy (paridad exacta, ver README) — TikTok manda muchos mas campos
+// por mensaje que se ignoran a proposito.
+
+// Envoltorio del WebSocket (wss://webcast-ws.tiktok.com/webcast/im/ws_proxy/...).
+// El campo `payload` viaja gzip-eado cuando el header "compress_type"=gzip
+// esta presente en headersList (confirmado por captura: magic bytes 1f8b).
+message PushFrame {
+  uint64 seqId = 1;
+  uint64 logId = 2;
+  uint64 service = 3;
+  uint64 method = 4;
+  repeated HeadersListEntry headersList = 5;
+  string payloadEncoding = 6;
+  string payloadType = 7;
+  bytes payload = 8;
+}
+
+message HeadersListEntry {
+  string key = 1;
+  string value = 2;
+}
+
+// El payload (ya descomprimido) de un PushFrame, y tambien el body entero de
+// GET webcast/im/fetch/ (ese SIN el envoltorio PushFrame, va directo).
+message Response {
+  repeated Message messages = 1;
+}
+
+message Message {
+  string method = 1; // "WebcastChatMessage", "WebcastLikeMessage", etc.
+  bytes payload = 2;
+}
+
+// Submensaje compartido por (aparentemente) todos los tipos de mensaje.
+message Common {
+  string method = 1;
+  uint64 msgId = 2;
+  uint64 roomId = 3;
+  uint64 createTime = 4;
+  bool isShown = 6;
+  DisplayText displayText = 8;
+  string logId = 12;
+}
+
+// El "toast" que TikTok arma para mostrar en el feed del chat ("X followed
+// the LIVE creator", "X shared the LIVE", etc). `key` es el discriminador
+// real entre follow/share dentro de un mismo WebcastSocialMessage — no hay
+// un campo numerico separado para eso, se valido con capturas reales:
+// key="pm_main_follow_message_viewer_2" -> follow,
+// key="pm_mt_guidance_share" -> share.
+message DisplayText {
+  string key = 1;
+  string template = 2;
+}
+
+// Submensaje de usuario, compartido por Chat/Like/Member/Gift/Social.
+message User {
+  uint64 userIdNumeric = 1;
+  string nickname = 3;
+  string uniqueId = 38;
+  string secUid = 46;
+  // Lista de badges (nivel, club de fans, etc). Repetido — un usuario sin
+  // ningun badge no manda este campo. Ver isFanClubMember() en
+  // src/decode/is-fan-club-member.js para como se usa esto en la practica.
+  repeated Badge badges = 64;
+}
+
+// Validado comparando un usuario miembro del club de fans contra uno que no
+// lo es (mismo live, mismo momento): el que SI es fan tiene una entrada acá
+// cuyo icono contiene "fans_badge_icon"; el que no, no la tiene (puede tener
+// otros badges igual, ej. de nivel — el icono es el discriminador real).
+message Badge {
+  BadgeDetail detail = 23;
+}
+message BadgeDetail {
+  BadgeAsset asset = 2;
+}
+message BadgeAsset {
+  string iconPath = 2; // ej. "webcast-va/webcast-va-fans_badge_icon_lv1_v2.png"
+}
+
+message WebcastChatMessage {
+  Common common = 1;
+  User user = 2;
+  // Confianza ALTA — confirmado con 10+ mensajes reales de 2 lives distintos,
+  // incluyendo texto largo con diacriticos (vietnamita) sin truncamiento.
+  string comment = 3;
+}
+
+message WebcastLikeMessage {
+  Common common = 1;
+  uint64 count = 2; // validado: 2 en la captura (cantidad de likes de este evento)
+  uint64 total = 3; // validado: 564948 (acumulado de la sala)
+  User user = 5;
+}
+
+message WebcastMemberMessage {
+  Common common = 1;
+  User user = 2;
+}
+
+// follow y share llegan como el MISMO tipo de mensaje — distinguir por
+// common.displayText.key (ver DisplayText arriba).
+message WebcastSocialMessage {
+  Common common = 1;
+  User user = 2;
+}
+
+message WebcastGiftMessage {
+  Common common = 1;
+  uint64 giftId = 2;
+  // Conteo ACUMULADO del combo (no un delta): validado enviando una Rosa en
+  // combo real, se vio 1 -> 4 -> 7 -> 10 -> 10 (el ultimo repetido = el
+  // "sello" final). Diamantes totales gastados = diamondCount * groupCount.
+  uint64 groupCount = 5;
+  User user = 7;
+  GiftStruct gift = 15;
+
+  // No hay un booleano "repeatEnd" limpio y aislado (a diferencia de lo que
+  // asume el filtro actual de TikLiveTTS). El mensaje "final" del combo se
+  // distingue porque 3 campos de delta internos (no expuestos acá, ver
+  // README) quedan en 0/ausentes — en la practica alcanza con quedarse con
+  // el groupCount mas alto visto por combo y no esperar una señal de fin.
+}
+
+message GiftStruct {
+  string describe = 2; // ej. "Sent Rose"
+  // Validado con 3 regalos de precio distinto (Rose=1, Welcome Dallah=1,
+  // Heart Me=4) — coincide con que Rose cuesta 1 diamante (dato publico).
+  uint64 diamondCount = 11;
+  string name = 16; // ej. "Rose"
+}
+
+message WebcastRoomUserSeqMessage {
+  Common common = 1;
+  // Validado: coincide exacto con el contador "Viewers · N" que muestra la
+  // propia UI de TikTok en el momento de la captura.
+  uint64 viewerCount = 3;
+}
