@@ -26,6 +26,49 @@ message HeadersListEntry {
   string value = 2;
 }
 
+// Heartbeat que el CLIENTE manda cada heartbeat_duration ms (10000, visto en
+// la URL del WS) para mantener viva la conexion. Validado capturando el
+// trafico SALIENTE real del navegador: PushFrame{payloadEncoding:"pb",
+// payloadType:"hb", payload:HeartbeatPayload}, sin seqId/logId/service/method.
+message HeartbeatPayload {
+  uint64 timestamp = 1;
+}
+
+// Frame que el navegador manda al conectar, antes del heartbeat. Replicarlo
+// SOLO no alcanzo para que el server empiece a empujar mensajes (probado:
+// 90s conectado, cero mensajes) — hace falta ademas EnterRoomFrame (abajo).
+// Significado exacto de cada campo no confirmado mas alla de los bytes.
+message ClientInfoPayload {
+  int32 unknown1 = 1; // visto: 2
+  string unknown2 = 2; // visto: "0"
+  string deviceId = 3;
+  uint64 timestamp = 4;
+}
+message ClientInfoCategory {
+  int32 unknown1 = 1; // visto: 3 en las 3 entradas
+  int32 category = 3; // visto: 0, 1, 2 (una entrada por cada una)
+}
+message ClientInfoFrame {
+  ClientInfoPayload info = 1;
+  repeated ClientInfoCategory categories = 2;
+}
+
+// La declaracion real de "entrar a la sala como espectador" — payloadType
+// "im_enter_room" (no "pb" generico). Sin este frame el WS acepta la
+// conexion y el heartbeat la mantiene viva, pero el servidor NUNCA empieza
+// a empujar mensajes reales (validado: con ClientInfoFrame solo, 90s sin
+// nada; hace falta este frame tambien).
+message EnterRoomPayload {
+  uint64 connId = 1; // visto un numero grande, parece random/unico por conexion
+  int32 unknown4 = 4; // visto: 12
+  string role = 5; // visto: "audience" (viene de identity= en la URL del WS)
+  // Formato visto: "{timestamp}_{roomId}_1_1_{timestamp}_0"
+  string sessionKey = 6;
+  int32 unknown7 = 7; // visto: 0
+  string unknown9 = 9; // visto: "0"
+  int32 unknown10 = 10; // visto: 0
+}
+
 // El payload (ya descomprimido) de un PushFrame, y tambien el body entero de
 // GET webcast/im/fetch/ (ese SIN el envoltorio PushFrame, va directo).
 message Response {

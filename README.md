@@ -21,25 +21,37 @@ Este paquete resuelve lo mismo con el Chromium que Electron ya trae: una
 `BrowserWindow` invisible navega tiktok.com y ejecuta el JS real de TikTok, lo
 que genera naturalmente parámetros firmados legítimos.
 
-**Arquitectura confirmada tras varias rondas de spike (ver "Hallazgos"
-abajo):** SÍ hay un WebSocket real (`wss://webcast-ws.tiktok.com/webcast/im/ws_proxy/...`)
-que empuja chat/gifts/likes/members en vivo — el primer spike no lo vio
-porque `session.webRequest` de Electron no intercepta WebSockets, hacía
-falta el protocolo CDP (`webContents.debugger`) para verlo. A diferencia de
-`im/fetch` (que usa una firma atada al querystring completo, no reusable),
-la URL del WS lleva su firma (`X-Bogus`) sobre parámetros de conexión
-estables (room_id, device info) — **no** sobre un cursor que cambia en cada
-mensaje. Eso significa que la ventana invisible solo necesita vivir lo
-suficiente para generar esa URL firmada UNA vez; a partir de ahí Node abre
-y mantiene su propia conexión WebSocket con el paquete `ws`, maneja el
-heartbeat (cada 10s, visto en la propia URL) y decodifica los frames
-entrantes con su propio parser protobuf (`src/decode/`, ver abajo) — sin
-mantener el Chromium invisible corriendo todo el tiempo de la conexión.
+**Arquitectura actual (`TikTokLiveClient`, `src/client.js` +
+`src/signing/live-window.js`):** SÍ hay un WebSocket real
+(`wss://webcast-ws.tiktok.com/webcast/im/ws_proxy/...`) que empuja
+chat/gifts/likes/members en vivo — el primer spike no lo vio porque
+`session.webRequest` de Electron no intercepta WebSockets, hacía falta el
+protocolo CDP (`webContents.debugger`) para verlo.
+
+La `BrowserWindow` invisible **se queda viva todo el tiempo que dure la
+conexión** y hace ella misma todo el trabajo pesado: resuelve la firma,
+abre el WS, y maneja el protocolo interno completo de TikTok (heartbeat
+cada 10s, un frame `im_enter_room` de "entrar a la sala", acks por cada
+mensaje recibido). `LiveWindow` solo escucha, vía CDP, los frames que la
+página ya recibió correctamente autenticados, y los decodifica — nunca
+arma ni firma un request propio. Es el camino **probado y funcionando**
+(validado en vivo contra 3 lives distintos, ver "Estado").
+
+**Camino alternativo, INCOMPLETO** (`src/signing/get-signed-ws-info.js` +
+`src/ws/webcast-socket.js`): capturar la URL firmada UNA vez y que Node
+abra su propia conexión WS con el paquete `ws`, sin mantener el Chromium
+vivo. Se llegó a conectar (agregando headers `Origin`/`User-Agent` que
+Node no manda solo, más un frame `im_enter_room` reconstruido a mano), pero
+el servidor nunca empezó a empujar mensajes reales — falta al menos un paso
+más del protocolo interno (posiblemente el mecanismo de acks) que no se
+terminó de reversar. Documentado tal cual quedó, no se borra porque casi
+funciona y puede retomarse con otra sesión de captura.
 
 ## Requisito de entorno
 
-**Necesita un proceso Electron vivo.** La extracción de firma depende de
-`BrowserWindow`, que solo existe dentro de Electron. A diferencia de
+**Necesita un proceso Electron vivo durante TODA la conexión**, no solo al
+arrancar — la `BrowserWindow` invisible se queda corriendo (silenciada con
+`setAudioMuted(true)`, nunca se escucha el audio del live). A diferencia de
 `tiktok-live-connector`, este paquete **no funciona en Node puro** ni en un
 script standalone sin Electron.
 
@@ -57,9 +69,7 @@ separada de cualquier sesión que la app principal use para otra cosa.
 ```js
 const { TikTokLiveClient } = require('@tiklivetts/tiktok-live-client');
 
-const client = new TikTokLiveClient(username, {
-  requestPollingIntervalMs: 2000, // sin uso por ahora, reservado para paridad de opciones
-});
+const client = new TikTokLiveClient(username);
 
 const { roomInfo } = await client.connect(); // resuelve al conectar, rechaza si falla
 // roomInfo: shape crudo de TikTok (owner.followInfo.followerCount, etc.) —
@@ -72,9 +82,10 @@ client.on('member', (data) => { /* ... */ });   // alguien entra a la sala
 client.on('follow', (data) => { /* ... */ });
 client.on('share', (data) => { /* ... */ });
 client.on('roomUserSeq', ({ viewerCount }) => { /* ... */ }); // viewer count en vivo
-client.on('disconnected', () => { /* ... */ }); // conexion caida, transitoria
-client.on('streamEnd', () => { /* ... */ });    // el directo termino de verdad
+client.on('disconnected', () => { /* ... */ }); // la ventana se cerro/murio
 client.on('error', (err) => { /* err es un Error real, con .message y .stack */ });
+// streamEnd: TODO, no implementado todavia (no se investigo como distinguir
+// "el streamer corto" de otras formas de desconexion).
 
 client.disconnect();
 client.removeAllListeners();
@@ -119,10 +130,11 @@ filtrar el TTS para leer solo chat de miembros del club de fans si se quiere.
   `.stack`) — nunca un objeto plano `{info, exception}` como hace
   `tiktok-live-connector`. Es un contrato más simple y el `readTikTokError`
   actual de TikLiveTTS ya soporta `Error` instances sin cambios.
-- **`disconnected`**: sin payload. Conexión caída, se espera reintento con
-  backoff por parte de quien orquesta (igual que hoy: la política de
-  reconexión vive en TikLiveTTS, no en este paquete).
-- **`streamEnd`**: sin payload. El directo terminó de verdad — no reintentar.
+- **`disconnected`**: sin payload. La ventana invisible se cerró/murió — no
+  hay reconexión automática todavía (ver "Preguntas abiertas"), la política
+  de reintento tiene que vivir en TikLiveTTS por ahora.
+- **`streamEnd`**: TODO, no implementado — no se investigó cómo distinguir
+  "el streamer cortó el directo" de otras formas de desconexión.
 
 ### Manejo de fallas de signing
 
@@ -226,11 +238,11 @@ consistentes, sin pérdida ni duplicación.
 
 ## Preguntas abiertas
 
-1. **TTL real de la URL firmada del WS** — cuánto se puede reconectar
-   reusando la misma sesión/URL antes de necesitar que la ventana invisible
-   genere una nueva.
-2. **Reconexión**: qué pasa cuando el WS cae (heartbeat_duration=10000 visto
-   en la URL sugiere que hay que mandar pings) — todavía no implementado.
+1. **Reconexión**: qué pasa cuando el WS cae — todavía no implementado en
+   `LiveWindow` (hoy solo emite `disconnected` cuando la ventana se destruye).
+2. **Camino Node-WS incompleto** — ver "Por qué existe" arriba. Falta un
+   paso del protocolo (probablemente acks) para que sea viable sin mantener
+   el Chromium vivo.
 3. **Nivel del club de fans** — se detecta membresía (`isFanClubMember`),
    pero no se decodificó el nivel/rango dentro del club (visto en la UI como
    badge "No.1" de top contribuyente, que podría ser algo distinto al nivel
@@ -250,9 +262,11 @@ consistentes, sin pérdida ni duplicación.
       miembro real y un no-miembro real en el mismo live.
 - [x] Verificación matemática del conteo de likes (deltas suman exacto
       contra el total de sala).
-- [ ] Cliente WS en Node (`ws`) que reusa la URL firmada capturada, maneja
-      heartbeat y reconexión con backoff.
-- [ ] Clase pública `TikTokLiveClient` (API documentada arriba) que orquesta
-      todo: ventana invisible → URL firmada → WS en Node → eventos —
-      incluir `viewerCount` y `isFanClubMember` en el contrato público.
+- [x] Clase pública `TikTokLiveClient` (`src/client.js` +
+      `src/signing/live-window.js`) — **funcionando end-to-end contra lives
+      reales**: chat, gift, like, member, follow, share, roomUserSeq e
+      `isFanClubMember`, todo validado en vivo (`npm run spike:client -- <usuario>`).
+- [ ] Reconexión con backoff cuando el WS cae.
+- [ ] Camino alternativo Node-WS puro (sin mantener el Chromium vivo) —
+      incompleto, ver "Por qué existe".
 - [ ] Publicación inicial a GitHub Packages.

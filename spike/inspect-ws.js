@@ -60,6 +60,14 @@ async function main() {
       console.log(`Handshake response guardado: ${file} (status ${params.response.status})`);
       return;
     }
+    if (method === 'Network.webSocketFrameSent') {
+      const { payloadData, opcode } = params.response;
+      const buf = opcode === 2 ? Buffer.from(payloadData, 'base64') : Buffer.from(payloadData, 'utf8');
+      const file = path.join(OUT_DIR, `ws-frame-SENT-${Date.now()}.bin`);
+      fs.writeFileSync(file, buf);
+      console.log(`\n>> ENVIADO por el navegador: ${file} (${buf.length} bytes, opcode ${opcode}, hex: ${buf.toString('hex')})`);
+      return;
+    }
     if (method === 'Network.webSocketFrameReceived') {
       if (frameCount >= MAX_FRAMES_TO_SAVE) return;
       frameCount++;
@@ -91,7 +99,7 @@ async function main() {
   console.log(`Navegando a ${liveUrl}...`);
   await win.loadURL(liveUrl);
 
-  const CAPTURE_MS = 200_000;
+  const CAPTURE_MS = 40_000;
   console.log(`Capturando durante ${CAPTURE_MS / 1000}s (hasta ${MAX_FRAMES_TO_SAVE} frames)...`);
   setTimeout(async () => {
     const cookies = await spikeSession.cookies.get({ domain: 'tiktok.com' });

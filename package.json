@@ -25,6 +25,7 @@
     "spike:signing": "electron spike/inspect-signing.js",
     "spike:body": "electron spike/inspect-body.js",
     "spike:ws": "electron spike/inspect-ws.js",
+    "spike:client": "electron spike/test-client.js",
     "test": "node test/decode-ws-frame.test.js"
   },
   "allowScripts": {
