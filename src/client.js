@@ -1,7 +1,7 @@
 'use strict';
 
 const { EventEmitter } = require('events');
-const { LiveWindow, SigningError, NotLiveError } = require('./signing/live-window');
+const { LiveWindow, SigningError, NotLiveError, LiveStatusUnknownError } = require('./signing/live-window');
 const { isFanClubMember } = require('./decode/is-fan-club-member');
 
 // Mapea cada tipo de mensaje decodificado (ver src/decode/decode-ws-frame.js)
@@ -78,4 +78,4 @@ class TikTokLiveClient extends EventEmitter {
   }
 }
 
-module.exports = { TikTokLiveClient, SigningError, NotLiveError };
+module.exports = { TikTokLiveClient, SigningError, NotLiveError, LiveStatusUnknownError };

@@ -3,6 +3,7 @@
 const { EventEmitter } = require('events');
 const { BrowserWindow, session } = require('electron');
 const { decodeWsFrame } = require('../decode/decode-ws-frame');
+const { classifyRoomEnterBody } = require('./classify-room-enter');
 
 const WS_URL_PATTERN = /webcast-ws\.tiktok\.com\/webcast\/im\/ws_proxy/;
 const ROOM_ENTER_PATTERN = /webcast\/room\/enter\//;
@@ -20,27 +21,44 @@ class SigningError extends Error {
 }
 
 // roomInfo.status === 2 es "en vivo" (unico valor confirmado contra una
-// captura real, ver spike/captures/). Cualquier otro valor con un body bien
-// formado se trata como "no esta en vivo" de verdad — no se distingue "nunca
-// empezo" de "ya termino" porque no hay una captura real del caso offline
-// para separar los codigos con confianza; ambos casos son "expected" para el
-// consumidor (mismo texto que ya reconoce ERRORES_CONEXION_ESPERADOS en
-// TikLiveTTS).
+// captura real, ver spike/captures/). Un data.status definido pero distinto
+// de 2 se sigue reportando como "no esta en vivo" (mismo texto que reconoce
+// ERRORES_CONEXION_ESPERADOS en TikLiveTTS) — pero `confirmed` queda en
+// `false` porque nunca se capturo una respuesta offline real que lo
+// confirme (ver README, pregunta abierta #5). No se distingue "nunca
+// empezo" de "ya termino" por el mismo motivo.
 //
-// `emptyBody: true` marca el caso distinto: el body de room/enter vino VACIO
-// (no un JSON de TikTok, nada) — visto en produccion (proceso Electron con
-// Express/WS server corriendo al lado) contra canales confirmados en vivo en
-// ese mismo instante, mientras un proceso Electron standalone con el mismo
-// codigo conectaba bien. No es una respuesta real de "no en vivo" de TikTok,
-// parece una falla transitoria de Network.getResponseBody bajo carga del
-// proceso principal — `connect()` reintenta unicamente para este caso.
+// IMPORTANTE: esto ya NO cubre body vacio, JSON invalido, forma inesperada
+// ni un status_code de error de TikTok sin data.status (ej. 4003110) — esos
+// casos son `LiveStatusUnknownError` (ver mas abajo), no "confirmado
+// offline". Ese era el bug real: una comprobacion que fallo (no pudimos
+// saber si esta en vivo) se mostraba igual que un offline confirmado.
 class NotLiveError extends Error {
-  constructor(username, { emptyBody = false } = {}) {
+  constructor(username, { confirmed = false } = {}) {
     super(`The requested user isn't online :(`);
     this.name = 'NotLiveError';
     this.code = 'NOT_LIVE';
     this.username = username;
-    this.emptyBody = emptyBody;
+    this.confirmed = confirmed;
+  }
+}
+
+// Cubre toda comprobacion de estado que NO pudo completarse con confianza:
+// body vacio (retryable, ver EMPTY_BODY_MAX_ATTEMPTS abajo), JSON invalido,
+// forma inesperada, un status_code de error de TikTok (se conserva en
+// `tiktokStatusCode`, ej. 4003110 — visto sin `data.status`, nunca
+// verificado que significa realmente, no se presenta como diagnostico
+// confirmado), o un fallo al pedir el body via CDP (se conserva en
+// `causeMessage`, antes se silenciaba con un catch vacio).
+class LiveStatusUnknownError extends Error {
+  constructor(username, reason, { tiktokStatusCode, causeMessage } = {}) {
+    super(`No se pudo comprobar si ${username} esta en vivo (${reason})`);
+    this.name = 'LiveStatusUnknownError';
+    this.code = 'LIVE_STATUS_UNKNOWN';
+    this.username = username;
+    this.reason = reason; // 'empty_body' | 'invalid_json' | 'unexpected_shape' | 'tiktok_status_code' | 'body_fetch_failed'
+    if (tiktokStatusCode !== undefined) this.tiktokStatusCode = tiktokStatusCode;
+    if (causeMessage) this.causeMessage = causeMessage;
   }
 }
 
@@ -58,16 +76,18 @@ class LiveWindow extends EventEmitter {
     this.dbg = null;
   }
 
-  // Reintenta SOLO el caso "body vacio" (ver NotLiveError#emptyBody) con una
-  // ventana nueva — un `status !== 2` con datos reales de TikTok se respeta
-  // a la primera, sin retraso, porque ahi confiamos en la respuesta.
+  // Reintenta SOLO el caso "body vacio" (LiveStatusUnknownError con
+  // reason:'empty_body') con una ventana nueva — cualquier otro resultado
+  // (en vivo, no en vivo, JSON invalido, status_code de error, fallo de CDP)
+  // se respeta a la primera, sin reintento general.
   async connect(opts = {}) {
     for (let attempt = 1; attempt <= EMPTY_BODY_MAX_ATTEMPTS; attempt++) {
       try {
         return await this._connectOnce(opts);
       } catch (err) {
         const lastAttempt = attempt === EMPTY_BODY_MAX_ATTEMPTS;
-        if (!(err instanceof NotLiveError) || !err.emptyBody || lastAttempt) throw err;
+        const isRetryableEmptyBody = err instanceof LiveStatusUnknownError && err.reason === 'empty_body';
+        if (!isRetryableEmptyBody || lastAttempt) throw err;
         await new Promise((r) => setTimeout(r, EMPTY_BODY_RETRY_DELAY_MS));
       }
     }
@@ -148,24 +168,41 @@ class LiveWindow extends EventEmitter {
           this.dbg.sendCommand('Network.getResponseBody', { requestId: params.requestId })
             .then((res) => {
               if (resolved) return;
-              let data = null;
-              try {
-                data = JSON.parse(res.body).data;
-              } catch (_) { /* data queda null, se trata como offline abajo */ }
+              const result = classifyRoomEnterBody(res.body);
 
-              if (!data || data.status !== 2) {
+              if (result.kind === 'live') {
                 resolved = true;
                 clearTimeout(timer);
-                if (this.win && !this.win.isDestroyed()) this.win.destroy();
-                reject(new NotLiveError(this.username, { emptyBody: !res.body }));
+                resolve(result.data);
                 return;
               }
 
               resolved = true;
               clearTimeout(timer);
-              resolve(data);
+              if (this.win && !this.win.isDestroyed()) this.win.destroy();
+
+              if (result.kind === 'not_live') {
+                reject(new NotLiveError(this.username, { confirmed: result.confirmed }));
+                return;
+              }
+              // result.kind === 'unknown': no pudimos comprobar, no es un
+              // offline confirmado (ver LiveStatusUnknownError arriba).
+              reject(new LiveStatusUnknownError(this.username, result.reason, {
+                tiktokStatusCode: result.tiktokStatusCode,
+                causeMessage: result.causeMessage,
+              }));
             })
-            .catch(() => { /* best-effort */ });
+            // Antes silenciado (`.catch(() => {})`): un fallo real de CDP al
+            // pedir el body (ej. "No resource with given identifier found",
+            // tipico cuando el body ya fue evictado del buffer) dejaba la
+            // promesa colgada hasta el timeout de 30s sin decir por que.
+            .catch((err) => {
+              if (resolved) return;
+              resolved = true;
+              clearTimeout(timer);
+              if (this.win && !this.win.isDestroyed()) this.win.destroy();
+              reject(new LiveStatusUnknownError(this.username, 'body_fetch_failed', { causeMessage: err.message }));
+            });
           return;
         }
 
@@ -201,4 +238,4 @@ class LiveWindow extends EventEmitter {
   }
 }
 
-module.exports = { LiveWindow, SigningError, NotLiveError };
+module.exports = { LiveWindow, SigningError, NotLiveError, LiveStatusUnknownError };

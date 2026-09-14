@@ -183,17 +183,30 @@ lanza excepciones sin capturar — todo error observable sale por `error` o por
 el rechazo de la promesa de `connect()`, para que TikLiveTTS lo pueda loguear
 a GlitchTip igual que hace con sus otros canales.
 
-Si la sala no está en vivo (nunca empezó o ya terminó), `connect()` rechaza
-con un `NotLiveError` (`err.code === 'NOT_LIVE'`, `err.message === "The
-requested user isn't online :("`). Se detecta leyendo `roomInfo.status` de la
+Si la sala no está en vivo, `connect()` rechaza con un `NotLiveError`
+(`err.code === 'NOT_LIVE'`, `err.message === "The requested user isn't
+online :("`, `err.confirmed === false` porque nunca se capturó una respuesta
+offline real que lo confirme). Se detecta leyendo `roomInfo.status` de la
 respuesta de `room/enter/` — `status === 2` es el único valor confirmado
-como "en vivo" contra una captura real; cualquier otro valor (o un body que
-no parsea) se trata como no-en-vivo. No distingue "nunca empezó" de "ya
-terminó" porque no hay una captura real del caso offline para separar los
-códigos con confianza — el texto del mensaje es intencionalmente igual al que
-usaba `tiktok-live-connector`, para que el filtro de errores esperados que ya
-tiene TikLiveTTS (`ERRORES_CONEXION_ESPERADOS` en `electron-shell/glitchtip.js`)
-lo reconozca sin cambios.
+como "en vivo" contra una captura real; un `data.status` definido pero
+distinto de 2 se sigue tratando como no-en-vivo. El texto del mensaje es
+intencionalmente igual al que usaba `tiktok-live-connector`, para que el
+filtro de errores esperados que ya tiene TikLiveTTS
+(`ERRORES_CONEXION_ESPERADOS` en `electron-shell/glitchtip.js`) lo reconozca
+sin cambios.
+
+Cualquier otro resultado de la comprobación (body vacío, JSON inválido,
+forma inesperada, un `status_code` de error de TikTok sin `data.status` —
+ej. `4003110`, visto en producción sin verificar su significado — o un fallo
+al pedir el body vía CDP) rechaza con `LiveStatusUnknownError`
+(`err.code === 'LIVE_STATUS_UNKNOWN'`, `err.reason` distingue el motivo,
+`err.tiktokStatusCode`/`err.causeMessage` cuando aplican). Antes, todos estos
+casos se convertían en `NotLiveError` — un fallo de comprobación no debe
+confundirse con un offline confirmado. Clasificación en
+`src/signing/classify-room-enter.js` (función pura, testeada aparte de CDP/
+Electron en `test/classify-room-enter.test.js`). Solo `reason:'empty_body'`
+se reintenta (hasta `EMPTY_BODY_MAX_ATTEMPTS`, ver `live-window.js`); el
+resto se respeta a la primera.
 
 ## Versionado y publicación
 
