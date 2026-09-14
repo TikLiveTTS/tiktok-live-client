@@ -11,6 +11,14 @@ const CHECK_ALIVE_PATTERN = /webcast\/room\/check_alive\//;
 const SESSION_PARTITION = 'persist:tiktok-live-client';
 const EMPTY_BODY_MAX_ATTEMPTS = 3;
 const EMPTY_BODY_RETRY_DELAY_MS = 500;
+// EXPERIMENTO (a pedido explicito, ver handoff de continuidad de conexion):
+// ante un cuerpo vacio de room/enter (el unico caso "sin info" real — no hay
+// dato alguno, a diferencia de un status_code o un JSON invalido, que si
+// traen algo), en vez de destruir la ventana al instante se la revela por
+// este tiempo antes de cerrarla. Hipotesis a comprobar: el throttling de una
+// ventana en segundo plano (show:false) podria ser parte de por que la
+// firma/anti-bot de TikTok a veces no llega a completar a tiempo.
+const AMBIGUOUS_REVEAL_MS = 10000;
 
 class SigningError extends Error {
   constructor(message) {
@@ -179,18 +187,36 @@ class LiveWindow extends EventEmitter {
 
               resolved = true;
               clearTimeout(timer);
-              if (this.win && !this.win.isDestroyed()) this.win.destroy();
 
               if (result.kind === 'not_live') {
+                if (this.win && !this.win.isDestroyed()) this.win.destroy();
                 reject(new NotLiveError(this.username, { confirmed: result.confirmed }));
                 return;
               }
+
               // result.kind === 'unknown': no pudimos comprobar, no es un
               // offline confirmado (ver LiveStatusUnknownError arriba).
-              reject(new LiveStatusUnknownError(this.username, result.reason, {
+              const unknownErr = new LiveStatusUnknownError(this.username, result.reason, {
                 tiktokStatusCode: result.tiktokStatusCode,
                 causeMessage: result.causeMessage,
-              }));
+              });
+
+              // Ver AMBIGUOUS_REVEAL_MS arriba — solo "sin info" real (cuerpo
+              // vacio), coincide con el reintento interno ya existente
+              // (EMPTY_BODY_MAX_ATTEMPTS). Otros "unknown" (JSON invalido,
+              // status_code de TikTok, forma inesperada) cierran como antes,
+              // sin reintento interno, asi que no aplica revelarlos aca.
+              if (result.reason === 'empty_body' && this.win && !this.win.isDestroyed()) {
+                this.win.show();
+                setTimeout(() => {
+                  if (this.win && !this.win.isDestroyed()) this.win.destroy();
+                  reject(unknownErr);
+                }, AMBIGUOUS_REVEAL_MS);
+                return;
+              }
+
+              if (this.win && !this.win.isDestroyed()) this.win.destroy();
+              reject(unknownErr);
             })
             // Antes silenciado (`.catch(() => {})`): un fallo real de CDP al
             // pedir el body (ej. "No resource with given identifier found",
