@@ -1,7 +1,7 @@
 'use strict';
 
 const { EventEmitter } = require('events');
-const { BrowserWindow, session } = require('electron');
+const { BrowserWindow, screen, session } = require('electron');
 const { decodeWsFrame } = require('../decode/decode-ws-frame');
 const { classifyRoomEnterBody } = require('./classify-room-enter');
 
@@ -104,7 +104,8 @@ class LiveWindow extends EventEmitter {
 
   async _connectOnce({ timeoutMs = 30000 } = {}) {
     const spikeSession = session.fromPartition(SESSION_PARTITION);
-    this.win = new BrowserWindow({ show: false, webPreferences: { session: spikeSession, backgroundThrottling: false } });
+    const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+    this.win = new BrowserWindow({ show: false, focusable: false, skipTaskbar: true, width: 60, height: 60, x: width - 70, y: height - 70, webPreferences: { session: spikeSession, backgroundThrottling: false } });
     // La pagina real de TikTok reproduce el video/audio del live — invisible
     // no significa muda. Sin esto el usuario escucharia el live de fondo.
     this.win.webContents.setAudioMuted(true);
@@ -207,7 +208,7 @@ class LiveWindow extends EventEmitter {
               // status_code de TikTok, forma inesperada) cierran como antes,
               // sin reintento interno, asi que no aplica revelarlos aca.
               if (result.reason === 'empty_body' && this.win && !this.win.isDestroyed()) {
-                this.win.show();
+                this.win.showInactive();
                 setTimeout(() => {
                   if (this.win && !this.win.isDestroyed()) this.win.destroy();
                   reject(unknownErr);
