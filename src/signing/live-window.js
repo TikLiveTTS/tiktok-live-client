@@ -18,7 +18,7 @@ const EMPTY_BODY_RETRY_DELAY_MS = 500;
 // este tiempo antes de cerrarla. Hipotesis a comprobar: el throttling de una
 // ventana en segundo plano (show:false) podria ser parte de por que la
 // firma/anti-bot de TikTok a veces no llega a completar a tiempo.
-const AMBIGUOUS_REVEAL_MS = 10000;
+const AMBIGUOUS_REVEAL_MS = 5000;
 
 class SigningError extends Error {
   constructor(message) {
