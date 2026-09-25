@@ -12,7 +12,7 @@
 // un reintento general.
 
 const assert = require('assert');
-const { LiveWindow, NotLiveError, LiveStatusUnknownError, SigningError } = require('../src/signing/live-window');
+const { LiveWindow, NotLiveError, LiveStatusUnknownError, SigningError, AuthRequiredError } = require('../src/signing/live-window');
 
 async function run() {
   // 1. Reintenta solo ante LiveStatusUnknownError('empty_body'), hasta 3
@@ -106,6 +106,27 @@ async function run() {
     }
     assert.strictEqual(calls, 1);
     assert.ok(thrown instanceof SigningError);
+  }
+
+  // 6. AuthRequiredError (TikTok redirigio a /login) tampoco reintenta —
+  // reintentar no lo resuelve, hace falta que el usuario inicie sesion.
+  {
+    const win = new LiveWindow('canal_test');
+    let calls = 0;
+    win._connectOnce = async () => {
+      calls++;
+      throw new AuthRequiredError('canal_test');
+    };
+    let thrown = null;
+    try {
+      await win.connect();
+    } catch (err) {
+      thrown = err;
+    }
+    assert.strictEqual(calls, 1, 'AuthRequiredError no deberia reintentar');
+    assert.ok(thrown instanceof AuthRequiredError);
+    assert.strictEqual(thrown.code, 'AUTH_REQUIRED');
+    assert.strictEqual(thrown.username, 'canal_test');
   }
 
   console.log('OK — LiveWindow#connect(): reintento acotado a empty_body (3 intentos), resto se respeta a la primera');

@@ -5,11 +5,12 @@ const { BrowserWindow, screen, session } = require('electron');
 const { decodeWsFrame } = require('../decode/decode-ws-frame');
 const { classifyRoomEnterBody } = require('./classify-room-enter');
 const { classifyCheckAliveBody } = require('./classify-check-alive');
+const { isTikTokLoginUrl } = require('../session/is-login-url');
+const { DEFAULT_SESSION_PARTITION } = require('../session/tiktok-session');
 
 const WS_URL_PATTERN = /webcast-ws\.tiktok\.com\/webcast\/im\/ws_proxy/;
 const ROOM_ENTER_PATTERN = /webcast\/room\/enter\//;
 const CHECK_ALIVE_PATTERN = /webcast\/room\/check_alive\//;
-const SESSION_PARTITION = 'persist:tiktok-live-client';
 const EMPTY_BODY_MAX_ATTEMPTS = 3;
 const EMPTY_BODY_RETRY_DELAY_MS = 500;
 // EXPERIMENTO (a pedido explicito, ver handoff de continuidad de conexion):
@@ -71,6 +72,26 @@ class LiveStatusUnknownError extends Error {
   }
 }
 
+// TikTok redirigio la navegacion del live a /login: exige una sesion
+// autenticada para ver este live. NO es un fallo tecnico (no se arregla solo
+// reintentando) ni un "no esta en vivo" — el consumidor tiene que pedirle al
+// usuario que inicie sesion (openTikTokLoginWindow, misma particion) y recien
+// ahi volver a conectar. Se detecta por la NAVEGACION real del frame
+// principal (did-start-navigation / will-redirect), no por el ERR_ABORTED
+// (-3) crudo con el que rechaza loadURL cuando la pagina se va a /login: ese
+// codigo tambien aparece por otras razones tecnicas (GlitchTip #77 lo dejaba
+// caer como error generico sin `code`). El mensaje es estable y en ingles a
+// proposito, igual que NotLiveError: TikLiveTTS lo matchea para no reportarlo
+// como issue.
+class AuthRequiredError extends Error {
+  constructor(username) {
+    super(`TikTok requires login to open @${username}/live`);
+    this.name = 'AuthRequiredError';
+    this.code = 'AUTH_REQUIRED';
+    this.username = username;
+  }
+}
+
 // Camino probado (ver README#hallazgos-del-spike): una BrowserWindow
 // invisible navega al live con una sesion anonima propia y se queda VIVA
 // todo el tiempo de la conexion. TikTok mismo hace el signing, abre el WS y
@@ -78,9 +99,10 @@ class LiveStatusUnknownError extends Error {
 // modulo solo escucha, via CDP, los frames que ya llegaron correctamente
 // firmados y autenticados, y los decodifica. No arma ni firma nada propio.
 class LiveWindow extends EventEmitter {
-  constructor(username) {
+  constructor(username, { partition = DEFAULT_SESSION_PARTITION } = {}) {
     super();
     this.username = username;
+    this.partition = partition;
     this.win = null;
     this.dbg = null;
   }
@@ -104,7 +126,7 @@ class LiveWindow extends EventEmitter {
   }
 
   async _connectOnce({ timeoutMs = 30000 } = {}) {
-    const spikeSession = session.fromPartition(SESSION_PARTITION);
+    const spikeSession = session.fromPartition(this.partition);
     const { width, height } = screen.getPrimaryDisplay().workAreaSize;
     this.win = new BrowserWindow({ show: false, focusable: false, skipTaskbar: true, width: 60, height: 60, x: width - 70, y: height - 70, webPreferences: { session: spikeSession, backgroundThrottling: false } });
     // La pagina real de TikTok reproduce el video/audio del live — invisible
@@ -142,6 +164,22 @@ class LiveWindow extends EventEmitter {
       const timer = setTimeout(() => {
         if (!resolved) reject(new SigningError(`Timeout (${timeoutMs}ms) esperando la firma de ${this.username}`));
       }, timeoutMs);
+
+      // Pedido de login de TikTok (ver AuthRequiredError arriba). Electron 41
+      // pasa un objeto `details` y ademas los argumentos posicionales viejos
+      // (url, isInPlace, isMainFrame) — se aceptan ambos. Solo el frame
+      // principal: un iframe interno a /login no es la pagina del live.
+      const onNavigation = (details, urlArg, _isInPlace, isMainFrameArg) => {
+        const url = (details && details.url) || urlArg;
+        const isMainFrame = details && details.isMainFrame !== undefined ? details.isMainFrame : isMainFrameArg;
+        if (resolved || isMainFrame === false || !isTikTokLoginUrl(url)) return;
+        resolved = true;
+        clearTimeout(timer);
+        if (this.win && !this.win.isDestroyed()) this.win.destroy();
+        reject(new AuthRequiredError(this.username));
+      };
+      this.win.webContents.on('did-start-navigation', onNavigation);
+      this.win.webContents.on('will-redirect', onNavigation);
 
       this.dbg.on('message', (_event, method, params) => {
         if (method === 'Network.responseReceived' && ROOM_ENTER_PATTERN.test(params.response.url || '')) {
@@ -252,7 +290,16 @@ class LiveWindow extends EventEmitter {
         }
       });
 
-      this.win.loadURL(`https://www.tiktok.com/@${this.username}/live`).catch(reject);
+      // Red de seguridad por si el reject de loadURL (ERR_ABORTED hacia
+      // /login) llega antes que el evento de navegacion: se mira la URL del
+      // error, nunca solo el codigo -3.
+      this.win.loadURL(`https://www.tiktok.com/@${this.username}/live`).catch((err) => {
+        if (!resolved && (isTikTokLoginUrl(err && err.url) || /https:\/\/www\.tiktok\.com\/login[?/]/.test((err && err.message) || ''))) {
+          onNavigation({ url: 'https://www.tiktok.com/login', isMainFrame: true });
+          return;
+        }
+        reject(err);
+      });
     });
 
     this.win.webContents.on('destroyed', () => this.emit('close'));
@@ -264,4 +311,4 @@ class LiveWindow extends EventEmitter {
   }
 }
 
-module.exports = { LiveWindow, SigningError, NotLiveError, LiveStatusUnknownError };
+module.exports = { LiveWindow, SigningError, NotLiveError, LiveStatusUnknownError, AuthRequiredError };

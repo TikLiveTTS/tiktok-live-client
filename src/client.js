@@ -1,7 +1,8 @@
 'use strict';
 
 const { EventEmitter } = require('events');
-const { LiveWindow, SigningError, NotLiveError, LiveStatusUnknownError } = require('./signing/live-window');
+const { LiveWindow, SigningError, NotLiveError, LiveStatusUnknownError, AuthRequiredError } = require('./signing/live-window');
+const { DEFAULT_SESSION_PARTITION, hasTikTokSession, openTikTokLoginWindow, clearTikTokSession } = require('./session/tiktok-session');
 const { isFanClubMember } = require('./decode/is-fan-club-member');
 
 // Mapea cada tipo de mensaje decodificado (ver src/decode/decode-ws-frame.js)
@@ -47,14 +48,18 @@ function toPublicPayload(method, data) {
 // primero que un build empaquetado real (no `npm run electron` en dev)
 // sobrevive una conexion contra un live real.
 class TikTokLiveClient extends EventEmitter {
-  constructor(username) {
+  // `partition`: particion de sesion de Electron para la ventana invisible
+  // (default: DEFAULT_SESSION_PARTITION). Tiene que ser la misma que se le
+  // pasa a openTikTokLoginWindow/clearTikTokSession para que el login aplique.
+  constructor(username, { partition } = {}) {
     super();
     this.username = username;
+    this.partition = partition;
     this.liveWindow = null;
   }
 
   async connect() {
-    this.liveWindow = new LiveWindow(this.username);
+    this.liveWindow = new LiveWindow(this.username, { partition: this.partition });
 
     this.liveWindow.on('message', ({ method, data }) => {
       if (!data) return;
@@ -80,4 +85,7 @@ class TikTokLiveClient extends EventEmitter {
   }
 }
 
-module.exports = { TikTokLiveClient, SigningError, NotLiveError, LiveStatusUnknownError };
+module.exports = {
+  TikTokLiveClient, SigningError, NotLiveError, LiveStatusUnknownError, AuthRequiredError,
+  DEFAULT_SESSION_PARTITION, hasTikTokSession, openTikTokLoginWindow, clearTikTokSession,
+};

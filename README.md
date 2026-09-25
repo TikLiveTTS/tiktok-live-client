@@ -92,6 +92,37 @@ parecer un "dispositivo nuevo" en cada arranque, lo que aumentaría el riesgo
 de fricción anti-bot). Esa sesión vive en su propia partition de Electron,
 separada de cualquier sesión que la app principal use para otra cosa.
 
+### Login opcional (0.1.8)
+
+Algunos lives redirigen a `https://www.tiktok.com/login?...` si la sesión es
+anónima. Antes eso salía como un `ERR_ABORTED (-3)` crudo de `loadURL`, sin
+`code` (GlitchTip #77). Ahora `LiveWindow` escucha la navegación real del
+frame principal (`did-start-navigation` / `will-redirect`, más la URL del
+error de `loadURL` como red de seguridad — nunca solo el código `-3`) y
+`connect()` rechaza con `AuthRequiredError` (`err.code === 'AUTH_REQUIRED'`,
+`err.username`). No se reintenta internamente: reintentar no lo resuelve.
+
+Para que el usuario inicie sesión, el paquete abre una ventana **visible** del
+login normal de TikTok sobre la **misma partition** que usa la ventana
+invisible. El paquete nunca ve ni guarda credenciales: TikTok autentica
+dentro de Chromium y lo único que queda son sus cookies en esa partition, que
+la ventana invisible reusa en el próximo `connect()`.
+
+```js
+const {
+  TikTokLiveClient, AuthRequiredError, DEFAULT_SESSION_PARTITION,
+  hasTikTokSession, openTikTokLoginWindow, clearTikTokSession,
+} = require('@tiklivetts/tiktok-live-client');
+
+// Aislar sesiones (ej. una por cuenta de la app): pasar la MISMA partition a todo.
+const partition = 'persist:tiktok-live-client-<cuenta>'; // default: DEFAULT_SESSION_PARTITION
+const client = new TikTokLiveClient(username, { partition });
+
+await hasTikTokSession(partition);                          // cookie `sessionid` vigente
+const { loggedIn } = await openTikTokLoginWindow({ partition }); // nunca rechaza; cierra sola al loguear
+await clearTikTokSession(partition);                         // logout: borra solo esa partition
+```
+
 ## API pública
 
 ```js
