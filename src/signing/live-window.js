@@ -6,6 +6,7 @@ const { decodeWsFrame } = require('../decode/decode-ws-frame');
 const { classifyRoomEnterBody } = require('./classify-room-enter');
 const { classifyCheckAliveBody } = require('./classify-check-alive');
 const { isTikTokLoginUrl } = require('../session/is-login-url');
+const { createRoomGuard } = require('./room-guard');
 const { DEFAULT_SESSION_PARTITION } = require('../session/tiktok-session');
 
 const WS_URL_PATTERN = /webcast-ws\.tiktok\.com\/webcast\/im\/ws_proxy/;
@@ -116,6 +117,10 @@ class LiveWindow extends EventEmitter {
       try {
         return await this._connectOnce(opts);
       } catch (err) {
+        // Todo intento fallido cierra SU ventana (timeout y reject de loadURL
+        // no la cerraban: quedaba viva con la pagina de TikTok corriendo hasta
+        // el proximo intento del consumidor, y podia seguir reenviando frames).
+        this.disconnect();
         const lastAttempt = attempt === EMPTY_BODY_MAX_ATTEMPTS;
         const isRetryableEmptyBody = err instanceof LiveStatusUnknownError && err.reason === 'empty_body';
         if (!isRetryableEmptyBody || lastAttempt) throw err;
@@ -156,14 +161,35 @@ class LiveWindow extends EventEmitter {
     // (mismo comportamiento que antes de este cambio, sin regresion).
     let streamEnded = false;
     const pendingCheckAlive = new Map();
+    // Ver room-guard.js: la pagina puede saltar sola a otro directo.
+    const roomGuard = createRoomGuard();
+    let roomChanged = false;
 
     const roomInfo = await new Promise((resolve, reject) => {
       let resolved = false;
       const pendingRoomEnter = new Map();
 
       const timer = setTimeout(() => {
-        if (!resolved) reject(new SigningError(`Timeout (${timeoutMs}ms) esperando la firma de ${this.username}`));
+        if (!resolved) { resolved = true; reject(new SigningError(`Timeout (${timeoutMs}ms) esperando la firma de ${this.username}`)); }
       }, timeoutMs);
+
+      // La pagina abrio el WS de OTRA sala: ya no es el directo pedido. Antes
+      // de conectar es un intento fallido mas; despues, una desconexion real
+      // ('roomChanged' + 'close') para que el consumidor vuelva a entrar a
+      // /@username/live en vez de leer en silencio el chat equivocado.
+      const onRoomChanged = (newRoomId) => {
+        if (roomChanged) return;
+        roomChanged = true;
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          this.disconnect();
+          reject(new SigningError(`La pagina de ${this.username} cambio de sala (${newRoomId}) antes de conectar`));
+          return;
+        }
+        this.emit('roomChanged', { roomId: roomGuard.roomId, newRoomId });
+        this.disconnect();
+      };
 
       // Pedido de login de TikTok (ver AuthRequiredError arriba). Electron 41
       // pasa un objeto `details` y ademas los argumentos posicionales viejos
@@ -187,6 +213,7 @@ class LiveWindow extends EventEmitter {
           return;
         }
         if (method === 'Network.responseReceived' && CHECK_ALIVE_PATTERN.test(params.response.url || '')) {
+          if (!roomGuard.acceptsCheckAlive(params.response.url)) return;
           pendingCheckAlive.set(params.requestId, true);
           return;
         }
@@ -273,9 +300,12 @@ class LiveWindow extends EventEmitter {
         // A partir de aca, frames reales del WS de TikTok — la conexion, el
         // signing y todo el protocolo interno ya los resolvio la pagina.
         if (method === 'Network.webSocketCreated' && WS_URL_PATTERN.test(params.url)) {
+          const newRoomId = roomGuard.onWebSocket(params.url);
+          if (newRoomId) onRoomChanged(newRoomId);
           return;
         }
         if (method === 'Network.webSocketFrameReceived') {
+          if (roomChanged) return;
           const { payloadData, opcode } = params.response;
           if (opcode !== 2) return; // solo frames binarios (protobuf)
           const buf = Buffer.from(payloadData, 'base64');
@@ -286,7 +316,12 @@ class LiveWindow extends EventEmitter {
             this.emit('error', new Error(`Frame WS no decodificable: ${err.message}`));
             return;
           }
-          for (const msg of decoded) this.emit('message', msg);
+          // Un mensaje de otra sala nunca se reenvia (ni cuenta como salud:
+          // si la pagina cambio de sala reusando el WS, el watchdog del
+          // consumidor deja de recibir senales y reconecta).
+          for (const msg of decoded) {
+            if (roomGuard.acceptsMessage(msg)) this.emit('message', msg);
+          }
         }
       });
 

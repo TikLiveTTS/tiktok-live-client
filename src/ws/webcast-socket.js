@@ -5,6 +5,7 @@ const WebSocket = require('ws');
 const protobuf = require('protobufjs');
 const path = require('path');
 const { decodeWsFrame } = require('../decode/decode-ws-frame');
+const { urlRoomIds } = require('../signing/room-guard');
 
 const root = protobuf.loadSync(path.join(__dirname, '..', 'proto', 'webcast.proto'));
 const PushFrame = root.lookupType('tiktoklive.PushFrame');
@@ -35,8 +36,8 @@ function extractDeviceId(wsUrl) {
 }
 
 function extractRoomId(wsUrl) {
-  const match = wsUrl.match(/[?&]room_id=(\d+)/);
-  return match ? match[1] : null;
+  const ids = urlRoomIds(wsUrl);
+  return ids ? ids[0] : null;
 }
 
 // La declaracion real de "entrar a la sala" — ver webcast.proto#EnterRoomPayload.

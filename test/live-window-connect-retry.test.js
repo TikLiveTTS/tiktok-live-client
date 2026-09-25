@@ -129,6 +129,19 @@ async function run() {
     assert.strictEqual(thrown.username, 'canal_test');
   }
 
+  // 7. Todo intento fallido cierra su ventana (antes timeout/loadURL la
+  // dejaban viva con la pagina corriendo hasta el proximo intento).
+  {
+    const win = new LiveWindow('canal_test');
+    let destroyed = 0;
+    win._connectOnce = async () => {
+      win.win = { isDestroyed: () => destroyed > 0, destroy: () => { destroyed++; } };
+      throw new SigningError('Timeout esperando la firma');
+    };
+    await win.connect().catch(() => {});
+    assert.strictEqual(destroyed, 1, 'la ventana del intento fallido deberia destruirse');
+  }
+
   console.log('OK — LiveWindow#connect(): reintento acotado a empty_body (3 intentos), resto se respeta a la primera');
 }
 

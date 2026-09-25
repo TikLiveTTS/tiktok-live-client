@@ -75,6 +75,9 @@ class TikTokLiveClient extends EventEmitter {
     this.liveWindow.on('streamEnd', () => this.emit('streamEnd'));
     // check_alive respondio alive=true — salud positiva independiente del chat.
     this.liveWindow.on('checkAlive', () => this.emit('checkAlive'));
+    // La pagina salto sola a otro directo (ver signing/room-guard.js). Igual
+    // que streamEnd, LiveWindow ya se desconecto: sigue un 'disconnected'.
+    this.liveWindow.on('roomChanged', (info) => this.emit('roomChanged', info));
 
     const { roomInfo } = await this.liveWindow.connect();
     return { roomInfo };
