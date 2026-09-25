@@ -4,6 +4,7 @@ const { EventEmitter } = require('events');
 const { BrowserWindow, screen, session } = require('electron');
 const { decodeWsFrame } = require('../decode/decode-ws-frame');
 const { classifyRoomEnterBody } = require('./classify-room-enter');
+const { classifyCheckAliveBody } = require('./classify-check-alive');
 
 const WS_URL_PATTERN = /webcast-ws\.tiktok\.com\/webcast\/im\/ws_proxy/;
 const ROOM_ENTER_PATTERN = /webcast\/room\/enter\//;
@@ -157,13 +158,11 @@ class LiveWindow extends EventEmitter {
           this.dbg.sendCommand('Network.getResponseBody', { requestId: params.requestId })
             .then((res) => {
               if (streamEnded) return;
-              let alive = true;
-              try {
-                const body = JSON.parse(res.body);
-                const entry = Array.isArray(body.data) ? body.data[0] : body.data;
-                if (entry && entry.alive === false) alive = false;
-              } catch (_) { /* shape inesperado: se ignora, no se asume fin de directo */ }
-              if (!alive) {
+              const alive = classifyCheckAliveBody(res.body);
+              // Senal positiva periodica (~6s): la pagina sigue viva y TikTok
+              // confirma que el directo continua, haya chat o no.
+              if (alive === true) this.emit('checkAlive');
+              if (alive === false) {
                 streamEnded = true;
                 this.emit('streamEnd');
                 this.disconnect();

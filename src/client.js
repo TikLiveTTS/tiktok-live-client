@@ -68,6 +68,8 @@ class TikTokLiveClient extends EventEmitter {
     // el 'close'/'disconnected' que sigue es un no-op para quien ya limpio
     // su estado en 'streamEnd' (mismo contrato que tiktok-live-connector).
     this.liveWindow.on('streamEnd', () => this.emit('streamEnd'));
+    // check_alive respondio alive=true — salud positiva independiente del chat.
+    this.liveWindow.on('checkAlive', () => this.emit('checkAlive'));
 
     const { roomInfo } = await this.liveWindow.connect();
     return { roomInfo };
