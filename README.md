@@ -113,6 +113,7 @@ client.on('roomUserSeq', ({ viewerCount }) => { /* ... */ }); // viewer count en
 client.on('disconnected', () => { /* ... */ }); // la ventana se cerro/murio
 client.on('error', (err) => { /* err es un Error real, con .message y .stack */ });
 client.on('streamEnd', () => { /* el streamer corto el directo */ });
+client.on('checkAlive', () => { /* TikTok confirmo que el directo sigue (~cada 6s) */ });
 
 client.disconnect();
 client.removeAllListeners();
@@ -173,6 +174,13 @@ filtrar el TTS para leer solo chat de miembros del club de fans si se quiere.
   `streamEnd`, `LiveWindow` llama a su propio `disconnect()` — el
   `disconnected` que sigue inmediatamente es normal, no hace falta manejarlo
   aparte.
+- **`checkAlive`**: sin payload. Misma respuesta de `check_alive` que
+  `streamEnd`, pero con `alive: true` — llega cada ~6s mientras la página
+  sigue viva y TikTok confirma que el directo continúa, **haya chat o no**.
+  Pensado como señal de salud independiente de la actividad del chat (un
+  live silencioso no manda frames de chat pero sí sigue confirmando esto).
+  Solo un `alive` booleano explícito cuenta: un shape desconocido no emite
+  ni `checkAlive` ni `streamEnd` (ver `src/signing/classify-check-alive.js`).
 
 ### Manejo de fallas de signing
 

@@ -26,7 +26,7 @@
     "spike:body": "electron spike/inspect-body.js",
     "spike:ws": "electron spike/inspect-ws.js",
     "spike:client": "electron spike/test-client.js",
-    "test": "node test/decode-ws-frame.test.js && node test/classify-room-enter.test.js && node test/live-window-connect-retry.test.js"
+    "test": "node test/decode-ws-frame.test.js && node test/classify-room-enter.test.js && node test/live-window-connect-retry.test.js && node test/classify-check-alive.test.js"
   },
   "allowScripts": {
     "electron@41.10.7": true
