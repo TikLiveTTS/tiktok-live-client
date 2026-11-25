@@ -4,6 +4,14 @@ const { EventEmitter } = require('events');
 const { LiveWindow, SigningError, NotLiveError, LiveStatusUnknownError, AuthRequiredError } = require('./signing/live-window');
 const { DEFAULT_SESSION_PARTITION, hasTikTokSession, openTikTokLoginWindow, clearTikTokSession } = require('./session/tiktok-session');
 const { isFanClubMember } = require('./decode/is-fan-club-member');
+const { fetchAvatarUrl } = require('./signing/fetch-avatar');
+
+// Eventos para los que vale la pena pagar el costo de una ventana oculta por
+// usuario nuevo (ver fetch-avatar.js): follow/share/gift son puntuales y se
+// muestran en alertas con foto. Deliberadamente afuera: 'like' y 'member'
+// (join) — en un live grande entran decenas/segundo, abrir una ventana por
+// cada visitante nuevo tumbaria la app.
+const AVATAR_EVENTS = new Set(['follow', 'share', 'gift']);
 
 // Mapea cada tipo de mensaje decodificado (ver src/decode/decode-ws-frame.js)
 // al shape publico documentado en el README — nunca se emite el objeto
@@ -64,7 +72,14 @@ class TikTokLiveClient extends EventEmitter {
     this.liveWindow.on('message', ({ method, data }) => {
       if (!data) return;
       const mapped = toPublicPayload(method, data);
-      if (mapped) this.emit(mapped[0], mapped[1]);
+      if (!mapped) return;
+      const [event, payload] = mapped;
+      if (AVATAR_EVENTS.has(event) && payload.uniqueId) {
+        fetchAvatarUrl(payload.uniqueId, { partition: this.partition })
+          .then((avatarUrl) => this.emit(event, { ...payload, avatarUrl }));
+        return;
+      }
+      this.emit(event, payload);
     });
     this.liveWindow.on('error', (err) => this.emit('error', err));
     this.liveWindow.on('close', () => this.emit('disconnected'));

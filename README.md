@@ -170,7 +170,7 @@ filtrar el TTS para leer solo chat de miembros del club de fans si se quiere.
     filtro que ya aplica TikLiveTTS, para no duplicar el guard en el consumidor).
   - `msgId` es el id de mensaje del server (string), único por mensaje — se
     usa para deduplicar. `'0'` cuenta como "sin id" en el consumidor actual.
-- **`gift`**: `{ giftId, giftName, diamondCount, groupCount, nickname, uniqueId, isFanClubMember }`
+- **`gift`**: `{ giftId, giftName, diamondCount, groupCount, nickname, uniqueId, isFanClubMember, avatarUrl }`
   - `groupCount` es el conteo ACUMULADO del combo actual (no un delta) —
     diamantes totales gastados hasta ahora = `diamondCount * groupCount`.
   - **No hay un `repeatEnd` limpio** (ver "Hallazgos" abajo) — el emisor
@@ -180,8 +180,18 @@ filtrar el TTS para leer solo chat de miembros del club de fans si se quiere.
     total actualizándose en vivo.
 - **`like`**: `{ uniqueId, nickname, likeCount, isFanClubMember }`
 - **`member`**: `{ uniqueId, nickname, isFanClubMember }` — alguien entra a la sala.
-- **`follow`**: `{ uniqueId, nickname }`
-- **`share`**: `{ uniqueId, nickname }`
+- **`follow`**: `{ uniqueId, nickname, avatarUrl }`
+- **`share`**: `{ uniqueId, nickname, avatarUrl }`
+
+`avatarUrl` (`follow`/`share`/`gift` únicamente, no `like`/`member`): TikTok no
+manda la foto de perfil en el frame WS del evento (confirmado contra
+fixtures reales) — se resuelve aparte con una `BrowserWindow` oculta que
+carga `tiktok.com/@uniqueId` (mismo patrón que `LiveWindow`, ver
+`src/signing/fetch-avatar.js`), cacheada por `uniqueId` durante la sesión.
+Nunca rechaza ni bloquea indefinidamente: ante timeout/anti-bot/red, el
+evento se emite igual con `avatarUrl: null`. Deliberadamente no se resuelve
+para `like`/`member` — son de alta frecuencia (decenas/segundo en un live
+grande) y abrir una ventana por usuario nuevo en esa cadencia no escala.
 - **`roomUserSeq`**: `{ viewerCount }` — cantidad de viewers en vivo, empuja
   actualizaciones periódicas (no es polling propio, es lo que ya manda
   TikTok por el WS).
